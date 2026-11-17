@@ -5,3 +5,4 @@ dependencies:
     version: "^1.0.0"
     rules:
       - if: "idf_version >=5.5.3"
+  espressif/esp_audio_codec: "^2.6.2"

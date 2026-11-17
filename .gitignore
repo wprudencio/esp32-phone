@@ -9,5 +9,8 @@ managed_components/
 # Setup logs
 *.log
 
+# Wi-Fi credentials
+main/secrets.h
+
 # macOS
 .DS_Store
