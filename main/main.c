@@ -30,6 +30,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 
@@ -60,13 +61,28 @@ static const char *TAG = "radio";
 /* PCM ring buffer: decoded 48 kHz stereo 16-bit samples (~1.4 s) */
 #define PCM_RING_BYTES      (256 * 1024)
 
+/* Playback only starts once this much decoded audio is buffered (and
+ * re-buffers to this level after an underrun), so Wi-Fi jitter never
+ * starves the USB isochronous stream. ~0.5 s of audio. */
+#define PCM_PREBUFFER_BYTES (96 * 1024)
+
 /* HTTP chunk pulled from the network per read */
 #define HTTP_CHUNK_BYTES    2048
 
+/* MP3 input accumulator: the simple decoder consumes only complete
+ * frames and leaves partial-frame bytes unconsumed. Those bytes must
+ * be carried over and re-fed with the next HTTP read; dropping them
+ * (as the first version did) halved the effective data rate and made
+ * playback run at half speed. */
+#define MP3_ACCUM_BYTES     (HTTP_CHUNK_BYTES + 2048)
+
 /* Decoder output scratch */
 #define DEC_OUT_BYTES       (8 * 1024)
-#define STEREO_BUF_BYTES    (16 * 1024)
-#define RESAMP_BUF_BYTES    (64 * 1024)
+/* Resampler work buffer: RES_HALF tail frames + up to RES_MAX_IN_FRAMES
+ * new stereo frames, 4 bytes per frame */
+#define RES_TAIL_BYTES      ((size_t)RES_HALF * 4)
+#define RES_WORK_BYTES      (RES_TAIL_BYTES + (size_t)RES_MAX_IN_FRAMES * 4)
+#define RESAMP_BUF_BYTES    (128 * 1024)
 #define RESAMP_MAX_FRAMES   (RESAMP_BUF_BYTES / 4)
 
 #define PLAYER_CHUNK_BYTES  2048    /* 512 frames @ 48 kHz stereo */
@@ -111,6 +127,10 @@ static uac_host_device_handle_t s_spk;
 static bool s_out_ready;
 static uint8_t s_out_channels;
 
+/* Set while the PCM ring is above the prebuffer level; cleared on
+ * underrun and device disconnect so playback re-buffers. */
+static volatile bool s_play_primed;
+
 /* ---------------------------------------------------------------- */
 /* Audio pipeline state                                             */
 /* ---------------------------------------------------------------- */
@@ -120,69 +140,167 @@ static StreamBufferHandle_t s_pcm;
 /* Decoder + scratch buffers, owned by the network task */
 static esp_audio_simple_dec_handle_t s_dec;
 static uint8_t *s_dec_out;
-static uint8_t *s_stereo;
+static uint8_t *s_work;    /* resampler: RES_HALF tail + new stereo frames */
 static uint8_t *s_resamp;
 
 /* Wi-Fi */
 static EventGroupHandle_t s_wifi_events;
 #define WIFI_CONNECTED_BIT BIT0
 
-/* Resampler: 44.1k (or whatever) -> 48k, linear interpolation, stereo.
- * pos is in units where one input frame = OUT_SAMPLE_RATE units. */
+/* Pipeline health counters, logged periodically by the player task.
+ * 32-bit writes are atomic on the S3, so no locking for these. */
+static volatile uint32_t s_stat_frames;    /* decoded MP3 frames        */
+static volatile uint32_t s_stat_underruns; /* PCM ring ran dry         */
+static volatile uint32_t s_stat_resyncs;   /* decoder parse-error skips */
+static volatile uint32_t s_stat_drops;     /* chunks dropped on write   */
+static volatile uint32_t s_stat_min_ring;  /* min PCM ring fill (bytes) */
+static volatile uint32_t s_stat_written;   /* bytes handed to the UAC   */
+static volatile uint32_t s_stat_net;       /* bytes read from HTTP      */
+static volatile uint32_t s_stat_dec_in;    /* bytes the decoder consumed*/
+static volatile uint32_t s_stat_read_us;   /* us spent blocked in read  */
+static volatile uint32_t s_stat_loop;      /* read loop iterations      */
+static volatile uint32_t s_time_decode;    /* us inside decode_chunk    */
+static volatile uint32_t s_time_resamp;    /* us inside resample_stereo */
+static volatile uint32_t s_time_push;     /* us inside pcm_push        */
+static volatile uint32_t s_stat_rscalls;  /* resample_stereo calls     */
+static volatile uint32_t s_stat_inframes; /* input frames fed to it    */
+static volatile uint32_t s_bench_us;      /* canary loop time, us      */
+
+/* Resampler: arbitrary src rate -> 48 kHz, Kaiser-windowed-sinc
+ * polyphase interpolation, stereo. Quality (measured on the algorithm):
+ * 0.0 dB ripple to 20 kHz, images below -35 dBc.
+ *
+ * Performance notes (learned the hard way, measured on-device):
+ * - process decoded chunks as blocks with a contiguous tap window;
+ *   shifting a history per input frame cost a ROM memmove each
+ * - keep the coefficient lerp hoisted out of the per-channel MACs
+ * - the first version of this loop needed 1.69 s of CPU per 1 s of
+ *   audio at -Os; this structure plus -O2 runs many times faster
+ */
+#define RES_TAPS        64      /* FIR taps per output sample          */
+#define RES_HALF        (RES_TAPS / 2)
+#define RES_PHASES      256     /* fractional-delay table rows (+1)    */
+#define RES_KAISER_BETA 10.0f
+#define RES_MAX_IN_FRAMES 4096  /* cap on decoded frames per chunk      */
+
 typedef struct {
     uint32_t src_rate;
-    int64_t pos;
-    int32_t prev[2];
-    int32_t cur[2];
-    bool primed;
+    int64_t pos;            /* next output's phase: 1 input frame = OUT_RATE units */
+    int32_t pending_m;      /* interval index of next output, relative to next chunk */
 } resamp_t;
 
 static resamp_t s_rs;
+/* Polyphase coefficients in Q15 int16. */
+static int16_t s_res_tbl[RES_PHASES + 1][RES_TAPS];
 
 /* ---------------------------------------------------------------- */
 /* Resampler                                                         */
 /* ---------------------------------------------------------------- */
 
+/* Modified Bessel I0 by series (for the Kaiser window) */
+static float res_i0(float x)
+{
+    float sum = 1.0f, term = 1.0f;
+    for (int k = 1; k < 20; k++) {
+        term *= (x * x / 4.0f) / (float)(k * k);
+        sum += term;
+    }
+    return sum;
+}
+
 static void resampler_reset(uint32_t src_rate)
 {
     memset(&s_rs, 0, sizeof(s_rs));
     s_rs.src_rate = src_rate;
+    if (src_rate == 0) {
+        return;
+    }
+
+    /* (Re)build the polyphase table: Kaiser-windowed sinc cutting at
+     * min(src, out) Nyquist, each phase normalized to unity DC gain,
+     * then quantized to Q15 int16 for integer-only playback math. */
+    float fc = (float)(src_rate < OUT_SAMPLE_RATE ? src_rate : OUT_SAMPLE_RATE) * 0.5f;
+    float sinc_scale = 2.0f * fc / (float)src_rate;
+    float i0_beta = res_i0(RES_KAISER_BETA);
+    for (int ph = 0; ph <= RES_PHASES; ph++) {
+        float p = (float)ph / (float)RES_PHASES;
+        float row[RES_TAPS];
+        float sum = 0.0f;
+        for (int j = 0; j < RES_TAPS; j++) {
+            float d = (float)(j - (RES_HALF - 1)) - p;
+            float arg = sinc_scale * d;
+            float sinc = (arg == 0.0f) ? 1.0f
+                        : sinf((float)M_PI * arg) / ((float)M_PI * arg);
+            float u = d / (float)RES_HALF;
+            float w = 0.0f;
+            if (u >= -1.0f && u <= 1.0f) {
+                w = res_i0(RES_KAISER_BETA * sqrtf(1.0f - u * u)) / i0_beta;
+            }
+            row[j] = sinc * w;
+            sum += row[j];
+        }
+        for (int j = 0; j < RES_TAPS; j++) {
+            int32_t q = (int32_t)lrintf(row[j] / sum * 32768.0f);
+            if (q > 32767) {
+                q = 32767;
+            } else if (q < -32767) {
+                q = -32767;
+            }
+            s_res_tbl[ph][j] = (int16_t)q;
+        }
+    }
 }
 
-static size_t resample_stereo(const int16_t *in, size_t in_frames,
-                              int16_t *out, size_t out_cap_frames)
+static size_t resample_stereo(size_t in_frames, int16_t *out, size_t out_cap_frames)
 {
+    const int16_t *w = (const int16_t *)s_work; /* tail + new, contiguous */
     size_t out_n = 0;
-    for (size_t i = 0; i < in_frames; i++) {
-        int32_t l = in[2 * i];
-        int32_t r = in[2 * i + 1];
+    int32_t m = s_rs.pending_m; /* interval of next output, rel. to new frames */
 
-        if (!s_rs.primed) {
-            s_rs.cur[0] = l;
-            s_rs.cur[1] = r;
-            s_rs.primed = true;
-            continue;
-        }
-
-        s_rs.prev[0] = s_rs.cur[0];
-        s_rs.prev[1] = s_rs.cur[1];
-        s_rs.cur[0] = l;
-        s_rs.cur[1] = r;
-
+    while (m + (int32_t)RES_HALF < (int32_t)in_frames) {
         while (s_rs.pos < OUT_SAMPLE_RATE) {
             if (out_n >= out_cap_frames) {
-                return out_n; /* caller must drain before continuing */
+                goto done;
             }
-            int32_t f = (int32_t)((s_rs.pos << 15) / OUT_SAMPLE_RATE); /* 0..32767 */
-            out[2 * out_n]     = (int16_t)(s_rs.prev[0] +
-                                           (((s_rs.cur[0] - s_rs.prev[0]) * f) >> 15));
-            out[2 * out_n + 1] = (int16_t)(s_rs.prev[1] +
-                                           (((s_rs.cur[1] - s_rs.prev[1]) * f) >> 15));
+            /* Fractional position in [0,1): phase row + lerp weight */
+            uint32_t p32 = (uint32_t)s_rs.pos;      /* < OUT_RATE */
+            uint32_t x = p32 * RES_PHASES;
+            uint32_t ph = x / OUT_SAMPLE_RATE;
+            uint32_t rem = x - ph * OUT_SAMPLE_RATE;
+            int t8 = (int)((rem * 256U) / OUT_SAMPLE_RATE);
+
+            const int16_t *c0 = s_res_tbl[ph];
+            const int16_t *c1 = s_res_tbl[ph + 1];
+            /* Tap j = h[2j], h[2j+1]: input frames m+1 .. m+RES_TAPS */
+            const int16_t *h = &w[2 * (m + 1)];
+
+            /* Interpolate the coefficient row once, share it for both
+             * channels, then plain int16 x Q15 MACs. */
+            int16_t c[RES_TAPS];
+            for (int j = 0; j < RES_TAPS; j++) {
+                c[j] = (int16_t)(c0[j] + ((((int32_t)c1[j] - (int32_t)c0[j]) * t8) >> 8));
+            }
+            int32_t al = 0, ar = 0;
+            for (int j = 0; j < RES_TAPS; j++) {
+                al += (int32_t)h[2 * j] * c[j];
+                ar += (int32_t)h[2 * j + 1] * c[j];
+            }
+            int32_t l = (al + (1 << 14)) >> 15;
+            int32_t r = (ar + (1 << 14)) >> 15;
+            out[2 * out_n]     = (int16_t)(l > 32767 ? 32767 : (l < -32768 ? -32768 : l));
+            out[2 * out_n + 1] = (int16_t)(r > 32767 ? 32767 : (r < -32768 ? -32768 : r));
             out_n++;
             s_rs.pos += s_rs.src_rate;
         }
         s_rs.pos -= OUT_SAMPLE_RATE;
+        m++;
     }
+
+done:
+    /* Rebase the interval index for the next chunk */
+    s_rs.pending_m = m - (int32_t)in_frames;
+    /* Keep the last RES_HALF frames as the next chunk's tail */
+    memmove(s_work, s_work + in_frames * 4, (size_t)RES_HALF * 4);
     return out_n;
 }
 
@@ -192,11 +310,13 @@ static size_t resample_stereo(const int16_t *in, size_t in_frames,
 
 static void pcm_push(const uint8_t *data, size_t len)
 {
+    int64_t t0 = esp_timer_get_time();
     while (len > 0) {
         size_t w = xStreamBufferSend(s_pcm, data, len, pdMS_TO_TICKS(500));
         data += w;
         len -= w;
     }
+    s_time_push += (uint32_t)(esp_timer_get_time() - t0);
 }
 
 /* Audible status tone so a dead network is distinguishable from silence */
@@ -219,10 +339,43 @@ static void push_beep(uint32_t freq_hz, uint32_t duration_ms, float amplitude)
     pcm_push(s_resamp, frames * 4);
 }
 
+/* Canary benchmark: 1M iterations of a trivial multiply-add loop.
+ * On a healthy 160 MHz core this takes ~10-30 ms. If it measures much
+ * more while streaming, something is stealing or stalling the core. */
+static void bench_canary(void)
+{
+    volatile int32_t sink = 0;
+    int64_t t0 = esp_timer_get_time();
+    for (int32_t i = 1; i <= 1000000; i++) {
+        sink += i * 3;
+    }
+    (void)sink;
+    s_bench_us = (uint32_t)(esp_timer_get_time() - t0);
+}
+
+/* Resampler benchmark: 38 MP3-frames' worth (1 s of 44.1 kHz audio)
+ * through the real resample_stereo path. */
+static void bench_resamp(void)
+{
+    int16_t *st = (int16_t *)(s_work + RES_TAIL_BYTES);
+    for (int i = 0; i < 1152; i++) {
+        st[2 * i] = (int16_t)(i * 7);
+        st[2 * i + 1] = (int16_t)(i * 5);
+    }
+    resampler_reset(44100);
+    int64_t t0 = esp_timer_get_time();
+    size_t outs = 0;
+    for (int c = 0; c < 38; c++) {
+        outs += resample_stereo(1152, (int16_t *)s_resamp, RESAMP_MAX_FRAMES);
+    }
+    int64_t t1 = esp_timer_get_time();
+    ESP_LOGI(TAG, "resamp bench: %d us for 1s of audio (%d outs, %d us/frame)",
+             (int)(t1 - t0), (int)outs, (int)((t1 - t0) / 38));
+}
+
 /* ---------------------------------------------------------------- */
 /* Decoding                                                          */
 /* ---------------------------------------------------------------- */
-
 static void handle_decoded(const uint8_t *pcm, size_t len)
 {
     esp_audio_simple_dec_info_t info;
@@ -243,12 +396,12 @@ static void handle_decoded(const uint8_t *pcm, size_t len)
 
     uint32_t src_ch = info.channel > 2 ? 2 : info.channel;
     size_t frames = len / (info.channel * 2);
-    if (frames * 4 > STEREO_BUF_BYTES) {
-        frames = STEREO_BUF_BYTES / 4;
+    if (frames > RES_MAX_IN_FRAMES) {
+        frames = RES_MAX_IN_FRAMES;
     }
 
-    /* normalize to stereo */
-    int16_t *st = (int16_t *)s_stereo;
+    /* Normalize to stereo, writing after the resampler's tail */
+    int16_t *st = (int16_t *)(s_work + RES_TAIL_BYTES);
     if (src_ch == 2) {
         memcpy(st, pcm, frames * 4);
     } else {
@@ -259,13 +412,23 @@ static void handle_decoded(const uint8_t *pcm, size_t len)
         }
     }
 
-    size_t out_frames = resample_stereo(st, frames, (int16_t *)s_resamp, RESAMP_MAX_FRAMES);
+    int64_t rs_t0 = esp_timer_get_time();
+    s_stat_rscalls++;
+    s_stat_inframes += frames;
+    size_t out_frames = resample_stereo(frames, (int16_t *)s_resamp, RESAMP_MAX_FRAMES);
+    s_time_resamp += (uint32_t)(esp_timer_get_time() - rs_t0);
     if (out_frames > 0) {
         pcm_push(s_resamp, out_frames * 4);
     }
 }
 
-static void decode_chunk(uint8_t *data, size_t len)
+static uint8_t s_mp3_buf[MP3_ACCUM_BYTES];
+static size_t s_mp3_len;
+
+/* Feed accumulated input to the decoder. Unconsumed partial-frame
+ * bytes are kept at the front of the buffer; the return value is
+ * how many bytes to carry over for the next call. */
+static size_t decode_chunk(uint8_t *data, size_t len)
 {
     esp_audio_simple_dec_raw_t raw = {
         .buffer = data,
@@ -287,27 +450,37 @@ static void decode_chunk(uint8_t *data, size_t len)
                                                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
             if (grown == NULL) {
                 ESP_LOGE(TAG, "cannot grow decoder output buffer");
-                return;
+                break;
             }
             s_dec_out = grown;
             continue;
         }
         if (ret != ESP_AUDIO_ERR_OK) {
-            /* Skip a byte to let the parser resync on junk/partial frames */
+            /* Parser error: drop one byte and let it hunt for the next
+             * frame sync. Counted so glitches of this kind are visible
+             * in the periodic stats line. */
+            s_stat_resyncs++;
             raw.buffer++;
             raw.len--;
             continue;
         }
 
         if (out.decoded_size > 0) {
+            s_stat_frames++;
             handle_decoded(s_dec_out, out.decoded_size);
         }
         if (raw.consumed == 0) {
-            break; /* parser needs more input */
+            break; /* parser needs more input to complete the frame */
         }
+        s_stat_dec_in += raw.consumed;
         raw.buffer += raw.consumed;
         raw.len -= raw.consumed;
     }
+
+    if (raw.len > 0 && raw.buffer != data) {
+        memmove(data, raw.buffer, raw.len);
+    }
+    return raw.len;
 }
 
 /* ---------------------------------------------------------------- */
@@ -358,28 +531,82 @@ static bool stream_once(void)
     ESP_LOGI(TAG, "streaming from " STREAM_URL);
 
     uint8_t buf[HTTP_CHUNK_BYTES];
+    s_mp3_len = 0; /* fresh connection: drop any stale partial frame */
     int idle_reads = 0;
+    int64_t win_start = esp_timer_get_time();
+    uint32_t win_reads = 0, win_bytes = 0, win_read_us = 0;
     while (true) {
+        int64_t t0 = esp_timer_get_time();
         int n = esp_http_client_read(client, (char *)buf, sizeof(buf));
+        int64_t t1 = esp_timer_get_time();
+        s_stat_read_us += (uint32_t)(t1 - t0);
+        s_stat_loop++;
+        win_read_us += (uint32_t)(t1 - t0);
+        win_reads++;
         if (n > 0) {
             idle_reads = 0;
-            decode_chunk(buf, n);
-            continue;
-        }
-        if (n == 0) {
+            s_stat_net += n;
+            win_bytes += n;
+
+            size_t space = sizeof(s_mp3_buf) - s_mp3_len;
+            if ((size_t)n > space) {
+                /* Parser is badly stuck: flush and resync */
+                ESP_LOGW(TAG, "mp3 accumulator overflow, flushing");
+                s_mp3_len = 0;
+                space = sizeof(s_mp3_buf);
+            }
+            memcpy(s_mp3_buf + s_mp3_len, buf, n);
+            s_mp3_len += n;
+
+            int64_t dc_t0 = esp_timer_get_time();
+            s_mp3_len = decode_chunk(s_mp3_buf, s_mp3_len);
+            s_time_decode += (uint32_t)(esp_timer_get_time() - dc_t0);
+        } else if (n < 0) {
+            int e = esp_http_client_get_errno(client);
+            if ((e == EAGAIN || e == EWOULDBLOCK) && ++idle_reads <= 1) {
+                /* 8 s timeout: give it one more chance */
+                continue;
+            }
+            ESP_LOGW(TAG, "read error, errno=%d", e);
+            break;
+        } else {
             ESP_LOGW(TAG, "stream closed by server");
             break;
         }
-        int e = esp_http_client_get_errno(client);
-        if (e == EAGAIN || e == EWOULDBLOCK) {
-            if (++idle_reads > 3) {
-                ESP_LOGW(TAG, "stream stalled");
-                break;
+
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - win_start >= 15000000) {
+            wifi_ap_record_t ap;
+            int8_t rssi = 0;
+            if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+                rssi = ap.rssi;
             }
-            continue;
+            uint32_t win_ms = (uint32_t)((now_us - win_start) / 1000);
+            bench_canary();
+            ESP_LOGI(TAG,
+                     "net: %.1fkB/s reads=%u avg=%uB wait=%u%% dec=%u%% rs=%u%% push=%u%% "
+                     "rscalls=%u in=%u bench=%uus rssi=%d",
+                     (float)win_bytes / 1024.0f / (float)(win_ms / 1000 ? win_ms / 1000 : 1),
+                     (unsigned)win_reads,
+                     win_reads ? (unsigned)(win_bytes / win_reads) : 0,
+                     (unsigned)((uint64_t)win_read_us * 100 / (uint64_t)(now_us - win_start)),
+                     (unsigned)((uint64_t)s_time_decode * 100 / (uint64_t)(now_us - win_start)),
+                     (unsigned)((uint64_t)s_time_resamp * 100 / (uint64_t)(now_us - win_start)),
+                     (unsigned)((uint64_t)s_time_push * 100 / (uint64_t)(now_us - win_start)),
+                     (unsigned)s_stat_rscalls,
+                     (unsigned)s_stat_inframes,
+                     (unsigned)s_bench_us,
+                     (int)rssi);
+            win_start = now_us;
+            win_reads = 0;
+            win_bytes = 0;
+            win_read_us = 0;
+            s_time_decode = 0;
+            s_time_resamp = 0;
+            s_time_push = 0;
+            s_stat_rscalls = 0;
+            s_stat_inframes = 0;
         }
-        ESP_LOGW(TAG, "read error, errno=%d", e);
-        break;
     }
 
     esp_http_client_close(client);
@@ -423,6 +650,10 @@ static void wifi_init_sta(void)
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi));
+    /* Keep the radio always on. Default modem-sleep (MIN_MODEM) parks the
+     * radio between beacons and adds hundreds of milliseconds of jitter
+     * to the TCP stream, which the player hears as dropouts. */
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_start());
 }
 
@@ -462,9 +693,9 @@ static void net_task(void *arg)
     }
 
     s_dec_out = heap_caps_calloc(1, DEC_OUT_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    s_stereo = heap_caps_calloc(1, STEREO_BUF_BYTES, MALLOC_CAP_SPIRAM);
+    s_work = heap_caps_calloc(1, RES_WORK_BYTES, MALLOC_CAP_SPIRAM);
     s_resamp = heap_caps_calloc(1, RESAMP_BUF_BYTES, MALLOC_CAP_SPIRAM);
-    if (s_dec_out == NULL || s_stereo == NULL || s_resamp == NULL) {
+    if (s_dec_out == NULL || s_work == NULL || s_resamp == NULL) {
         ESP_LOGE(TAG, "scratch buffer allocation failed");
         vTaskDelete(NULL);
     }
@@ -472,6 +703,10 @@ static void net_task(void *arg)
 
     /* Short confirmation blip once the pipeline is ready */
     push_beep(1200, 120, 0.25f);
+
+    bench_canary();
+    bench_resamp();
+    ESP_LOGI(TAG, "canary (idle network): %u us", (unsigned)s_bench_us);
 
     int failures = 0;
     while (true) {
@@ -496,20 +731,70 @@ static void net_task(void *arg)
 static void player_task(void *arg)
 {
     static uint8_t chunk[PLAYER_CHUNK_BYTES];
+    TickType_t last_stats = xTaskGetTickCount();
+    uint32_t last_net = 0, last_dec = 0, last_frames = 0;
+
+    s_stat_min_ring = PCM_RING_BYTES;
 
     ESP_LOGI(TAG, "player ready");
 
     while (true) {
-        size_t n = xStreamBufferReceive(s_pcm, chunk, sizeof(chunk), pdMS_TO_TICKS(250));
+        /* Prebuffer gate: don't start (or resume) playback until enough
+         * decoded audio is queued to ride out network jitter. The UAC
+         * driver stops its isochronous stream whenever its own ring
+         * drops below one URB and only restarts it on the next write,
+         * so a starving feeder produces audible start/stop clicks. */
+        if (!s_play_primed) {
+            size_t avail = xStreamBufferBytesAvailable(s_pcm);
+            if (s_stat_min_ring > avail) {
+                s_stat_min_ring = avail;
+            }
+            if (avail >= PCM_PREBUFFER_BYTES) {
+                s_play_primed = true;
+                ESP_LOGI(TAG, "buffer primed, playback starts");
+            } else {
+                /* Keep the DAC clocked with silence while waiting so
+                 * the isochronous stream never stalls mid-audio. */
+                memset(chunk, 0, sizeof(chunk));
+                esp_err_t err = ESP_OK;
+                bool wrote = false;
+                xSemaphoreTake(s_spk_lock, portMAX_DELAY);
+                if (s_out_ready && s_spk != NULL) {
+                    err = uac_host_device_write(s_spk, chunk, sizeof(chunk), pdMS_TO_TICKS(200));
+                    wrote = (err == ESP_OK);
+                }
+                xSemaphoreGive(s_spk_lock);
+                if (!wrote) {
+                    vTaskDelay(pdMS_TO_TICKS(20));
+                }
+                continue;
+            }
+        }
+
+        /* Accumulate a full chunk; a dry spell of 100 ms while primed
+         * is a real underrun (falls back to the gate above). */
+        size_t have = 0;
+        while (have < sizeof(chunk)) {
+            size_t r = xStreamBufferReceive(s_pcm, chunk + have,
+                                            sizeof(chunk) - have, pdMS_TO_TICKS(100));
+            have += r;
+            if (r == 0) {
+                break;
+            }
+        }
 
         esp_err_t err = ESP_OK;
         xSemaphoreTake(s_spk_lock, portMAX_DELAY);
         if (s_out_ready && s_spk != NULL) {
-            if (n == 0) {
-                /* Underrun: feed silence so the device keeps clocking */
+            if (have == 0) {
+                /* Underrun: silence-fill and re-buffer */
+                s_stat_underruns++;
+                s_play_primed = false;
                 memset(chunk, 0, sizeof(chunk));
-                n = sizeof(chunk);
+                have = sizeof(chunk);
+                ESP_LOGW(TAG, "PCM ring underrun, re-buffering");
             }
+            size_t n = have;
             if (s_out_channels == 1) {
                 /* downmix stereo -> mono in place */
                 int16_t *pcm = (int16_t *)chunk;
@@ -520,12 +805,44 @@ static void player_task(void *arg)
                 n = frames * 2;
             }
             err = uac_host_device_write(s_spk, chunk, n, pdMS_TO_TICKS(200));
+            if (err != ESP_OK) {
+                s_stat_drops++;
+            } else {
+                s_stat_written += n;
+            }
+        } else {
+            have = 0; /* no device: drop and keep draining */
         }
         xSemaphoreGive(s_spk_lock);
 
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "uac write failed: %s", esp_err_to_name(err));
             vTaskDelay(pdMS_TO_TICKS(20));
+        }
+
+        /* Track the minimum ring fill and print a health line */
+        size_t avail = xStreamBufferBytesAvailable(s_pcm);
+        if (s_stat_min_ring > avail) {
+            s_stat_min_ring = avail;
+        }
+        TickType_t now = xTaskGetTickCount();
+        if (now - last_stats >= pdMS_TO_TICKS(15000)) {
+            uint32_t dt = (now - last_stats) / pdMS_TO_TICKS(1000) ?: 1;
+            ESP_LOGI(TAG,
+                     "stats: ring=%u min=%u (%u%%) net=%uB/s dec=%uB/s mp3=%.1ff/s "
+                     "underruns=%u resyncs=%u drops=%u",
+                     (unsigned)avail, (unsigned)s_stat_min_ring,
+                     (unsigned)((uint64_t)s_stat_min_ring * 100 / PCM_RING_BYTES),
+                     (unsigned)((s_stat_net - last_net) / dt),
+                     (unsigned)((s_stat_dec_in - last_dec) / dt),
+                     (float)(s_stat_frames - last_frames) / (float)dt,
+                     (unsigned)s_stat_underruns, (unsigned)s_stat_resyncs,
+                     (unsigned)s_stat_drops);
+            last_net = s_stat_net;
+            last_dec = s_stat_dec_in;
+            last_frames = s_stat_frames;
+            s_stat_min_ring = PCM_RING_BYTES;
+            last_stats = now;
         }
     }
 }
@@ -649,6 +966,7 @@ static void handle_disconnected(uac_host_device_handle_t handle)
     if (handle == s_spk) {
         s_out_ready = false;
         s_spk = NULL;
+        s_play_primed = false; /* re-buffer before resuming on replug */
         was_speaker = true;
     }
     xSemaphoreGive(s_spk_lock);

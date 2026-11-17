@@ -1,13 +1,22 @@
 CONFIG_FREERTOS_HZ=1000
+# Performance build (-O2): the resampler MAC loop measured ~4x slower
+# at the default -Os codegen.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+# 240 MHz: headroom for TLS + MP3 decode + resampling in one task
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=2048
 # USB audio isochronous OUT needs a large periodic TX FIFO slice
 # (default "balanced" bias only allows 128-byte isoc OUT packets,
 #  USB headphones need up to ~512)
 CONFIG_USB_HOST_HW_BUFFER_BIAS_PERIODIC_OUT=y
-# 8 MB octal PSRAM on the S3 module: PCM ring + scratch buffers live here
+# 8 MB octal PSRAM on the S3 module: PCM ring + scratch buffers live here.
+# 40 MHz (not 80): the ring moves ~200 kB/s, so bandwidth is irrelevant,
+# while the conservative clock keeps PSRAM timing solid on this board
+# (at 80 MHz it ran marginal: memtest errors, cache stalls that slowed
+# the whole pipeline, and interrupt-watchdog reboots).
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
-CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_SPEED_40M=y
 # Only the MP3 decoder is used; keep the rest out of the binary
 CONFIG_AUDIO_DECODER_AAC_SUPPORT=n
 CONFIG_AUDIO_DECODER_G711_SUPPORT=n

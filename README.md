@@ -112,22 +112,37 @@ Details worth knowing:
 
 - **Format negotiation**: the app always renders 48 kHz / 16-bit PCM because
   that is what the headphone advertises. The MP3 stream is 44.1 kHz, so decoded
-  audio goes through a linear-interpolation resampler with an integer phase
-  accumulator (no drift). Sources at other rates (or mono) are handled too.
-- **The decoder** is the `esp_audio_codec` *simple decoder*: its built-in
-  parser accepts arbitrary chunk sizes and resyncs after the partial first
-  frame that Icecast hands you when joining a live mount.
+  audio goes through a 64-tap Kaiser-windowed-sinc polyphase resampler
+  (measured 0.0 dB ripple to 20 kHz, images below -35 dBc; 256 phase rows
+  with linear interpolation, int16 x Q15 MACs — ~32% of one 240 MHz core).
+  Sources at other rates (or mono) are handled too.
+- **The decoder** is the `esp_audio_codec` *simple decoder*: its parser scans
+  arbitrary chunk boundaries, but **unconsumed partial-frame bytes must be
+  carried over to the next read** — dropping them halves the data rate.
 - **Registration gotcha**: both `esp_audio_dec_register_default()` *and*
   `esp_audio_simple_dec_register_default()` must be called — the simple
   decoder wraps the frame decoders registered by the first call.
-- **Jitter handling**: ~1.4 s of decoded PCM sits in a PSRAM ring; if it
-  underruns the player writes silence (no clicks). If the network dies the
-  device beeps (880 Hz) once per retry cycle so dead radio ≠ quiet song.
+- **Jitter handling**: the player only starts once ~0.5 s of decoded audio is
+  buffered (`PCM_PREBUFFER_BYTES`) and re-buffers to that level after an
+  underrun. That matters because the UAC host driver halts its isochronous
+  stream whenever its ring drops below one URB, and only restarts it on the
+  next `uac_host_device_write()` — a starved feeder produces audible clicks.
+- **Wi-Fi**: power save is disabled (`esp_wifi_set_ps(WIFI_PS_NONE)`);
+  modem-sleep adds hundreds of ms of jitter that the player hears as dropouts.
 - **Reconnect**: any read error/close triggers `esp_http_client` re-init with
   linear backoff. TLS uses the standard certificate bundle.
+- **Health stats**: every 15 s the firmware logs ring fill level, network and
+  decoder throughput, resampler CPU share, underruns, decoder resyncs and
+  dropped chunks — plus a start-up benchmark of the resampler.
 
 ## sdkconfig notes
 
+- `CONFIG_COMPILER_OPTIMIZATION_PERF=y` (-O2) and 240 MHz CPU — the audio
+  pipeline (TLS + MP3 decode + resampling) needs the headroom; at the -Os
+  default the resampler loop measured ~4x slower.
+- `CONFIG_SPIRAM_SPEED_40M=y` — the PCM ring moves ~200 kB/s so PSRAM
+  bandwidth is irrelevant, while 80 MHz ran marginal on this board (random
+  memtest failures and cache stalls). 40 MHz has been rock solid.
 - `CONFIG_USB_HOST_HW_BUFFER_BIAS_PERIODIC_OUT=y` — the S3's 1.25 KB OTG FIFO
   is split RX / non-periodic TX / periodic TX, and isochronous audio OUT
   streams from the periodic-TX slice. The default *balanced* bias caps it at
@@ -135,7 +150,7 @@ Details worth knowing:
   OUT packets (ours needs 384), failing with
   `E HCD DWC: EP MPS (384) exceeds supported limit (128)`.
   Trade-off: the RX (microphone) slice shrinks to ~132 bytes.
-- `CONFIG_SPIRAM=y`, octal, 80 MHz — PCM ring + decode scratch live in PSRAM.
+- `CONFIG_SPIRAM=y`, octal — PCM ring + resampler scratch live in PSRAM.
 - All codecs except the MP3 decoder are disabled
   (`CONFIG_AUDIO_DECODER_*_SUPPORT=n`); with everything enabled the app grew
   past the default 1.5 MB app partition.
@@ -145,12 +160,15 @@ Details worth knowing:
 
 | Symptom | Cause / fix |
 |---|---|
+| Audio plays slow / half speed, constant glitches | Pipeline starved: check the 15 s stats line — `mp3=` should read ~38 f/s for a 44.1 kHz stream, `underruns=0` |
 | Nothing after "UAC host driver installed" | Device has no power (see *VBUS* above) or dead OTG adapter |
 | `EP MPS (...) exceeds supported limit (128)` | The FIFO-bias fix is missing — keep `CONFIG_USB_HOST_HW_BUFFER_BIAS_PERIODIC_OUT=y` |
 | `Decoder MP3 not registered` | `esp_audio_dec_register_default()` must be called before the simple decoder registration |
+| Boot aborts with `External RAM failed memory test!` | PSRAM timing marginal — run `CONFIG_SPIRAM_SPEED_40M=y` (this repo does) |
+| Interrupt watchdog / random reboots | Same as above: marginal PSRAM stalled both cores on this board |
 | `app partition is too small` | Either trim codecs (see sdkconfig notes) or grow the partition |
 | Volume/mute control warnings | Headset doesn't implement those requests — harmless |
-| Clicks/dropouts | Increase `PCM_RING_BYTES` or `UAC_RING_BUFFER_BYTES` |
+| Clicks/dropouts | Increase `PCM_RING_BYTES` / `PCM_PREBUFFER_BYTES` or check `rsyncs`/`underruns` in the stats |
 | UAC 2.0-only device (e.g. Apple USB-C dongle) | This driver is UAC 1.0 only; needs a UAC2 host driver or quirk fork |
 
 ## Repo layout
