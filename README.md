@@ -1,194 +1,104 @@
-# esp32-phone — ESP32-S3 USB-headphone internet radio
+# 📻 esp32-phone
 
-An [ESP-IDF](https://docs.espressif.com/projects/esp-idf/) firmware that turns an
-**ESP32-S3** dev kit into an **internet radio played through a USB headphone**:
-it joins Wi-Fi, streams **Rádio USP** (Icecast, MP3 128 kbps / 44.1 kHz stereo
-over HTTPS), decodes and resamples it to 48 kHz, and plays it on a USB Audio
-Class (UAC 1.0) headphone attached to the board's native USB port.
+**A pocket internet radio that plays Rádio USP straight into a USB headphone — no PC in the loop.**
 
-```
-                 Wi-Fi "CATNIP"
-                      │  HTTPS (TLS)
-                      ▼
-┌─────────────────────────────────────────────────────────────┐
-│ esp_http_client ─► MP3 simple decoder ─► 44.1k→48k resampler │
-│ (espressif/esp_audio_codec)                                  │
-│                      │                                       │
-│                      ▼                                       │
-│ PCM ring buffer, 256 KB in PSRAM (~1.4 s jitter buffer)      │
-│                      │                                       │
-│                      ▼                                       │
-│ USB host UAC driver (usb_host_uac) ─► USB headphone, 48 kHz  │
-└─────────────────────────────────────────────────────────────┘
-```
+![ESP32-S3](https://img.shields.io/badge/MCU-ESP32--S3-e7352c?style=flat-square)
+![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v5.5-1a73e8?style=flat-square)
+![Stream](https://img.shields.io/badge/stream-Icecast%20HTTPS-f57c00?style=flat-square)
+![Audio](https://img.shields.io/badge/audio-MP3%20128%20kbps-8e24aa?style=flat-square)
+![Output](https://img.shields.io/badge/output-USB%20UAC%201.0%20%E2%80%A2%2048%20kHz-00897b?style=flat-square)
 
-## Hardware
+![The rig](docs/rig.jpg)
 
-| Item | Value |
-|---|---|
-| Board | ESP32-S3 dev kit, **two USB-C ports** (16 MB flash, 8 MB PSRAM) |
-| `UART` port | CH343 USB-serial bridge — power, flashing, serial monitor |
-| `USB` port | Native USB-OTG (GPIO19 = D-, GPIO20 = D+) — host mode |
-| Device under test | USB headphone, `VID:PID 0020:0B21`, UAC 1.0 speaker + mic |
+> **What you see above:** an **ESP32-S3 dev kit** on a breadboard running this
+> firmware. The **USB headphones** (Baseus) plug into the board's **native USB
+> port** through a USB-C→USB-A OTG adapter — that port is the USB *host* side,
+> and the board powers the headphone through it. The second USB-C cable (UART
+> port) powers the board and carries logs/flashing. The extra jumper wires on
+> the breadboard are leftovers from earlier experiments — the radio needs none
+> of them. 🎧
 
-The headphone plugs into the **native USB port** (via a USB-C→USB-A OTG adapter
-if it has a USB-A plug). Flashing and logs go through the **UART port**.
-
-> ⚠️ An **ESP32-C3 can't do this** — it has no USB-OTG host. This project needs
-> an ESP32-S2 / S3 / P4 (any chip with a USB-OTG peripheral in host mode).
-
-### If a device doesn't enumerate at all
-
-Some dev kits don't feed 5 V back out of the native USB-C port, so the
-headphone never powers up. If the log shows nothing after
-`UAC host driver installed`, power the headphone externally:
+## 🎵 What it does
 
 ```
-ESP32-S3              USB-A female (OTG adapter)
-5V    ───────────────  VBUS (red)
-GND   ───────────────  GND  (black)
-GPIO20 (D+) ────────  D+    (green)
-GPIO19 (D-) ────────  D-    (white)
+Wi-Fi ── HTTPS ──► Icecast stream ──► MP3 decoder ──► 44.1k→48k resampler
+                                                          │
+                            USB headphone ◄── UAC host ◄── PSRAM jitter buffer (~1.4 s)
 ```
 
-(A powered USB hub also works. GND must be common.)
+- Joins Wi-Fi, pulls the **Rádio USP 128 kbps MP3** Icecast stream over TLS.
+- Decodes it with Espressif's `esp_audio_codec` and resamples 44.1 → 48 kHz
+  with a 64-tap Kaiser-windowed-sinc polyphase filter (flat to 20 kHz).
+- Buffers ~0.5 s before starting and keeps ~1.4 s of slack, so Wi-Fi jitter
+  never causes clicks; the headphone is fed by the **USB Audio Class 1.0**
+  host driver at its native 48 kHz / 16-bit stereo.
 
-## Setup
-
-Wi-Fi credentials live in `main/secrets.h`, which is **gitignored**:
+## 🚀 Build & flash
 
 ```sh
-cp main/secrets_example.h main/secrets.h
-# then edit: WIFI_SSID / WIFI_PASS
-```
-
-Stream URL and volume are in `main/main.c` (`STREAM_URL`, and
-`uac_host_device_set_volume(handle, 13)` in `handle_tx_connected()`).
-
-## Build & flash
-
-Requires ESP-IDF v5.5+ with the `esp32s3` tools installed:
-
-```sh
+cp main/secrets_example.h main/secrets.h   # put your Wi-Fi SSID/password here
 . ~/esp/esp-idf/export.sh
-cd esp32-phone
-idf.py set-target esp32s3
-idf.py -p /dev/cu.usbmodem5AE80117911 flash monitor
+idf.py -p /dev/cu.usbmodemXXXX flash monitor
 ```
 
-`Ctrl+]` exits the monitor. First build downloads `usb_host_uac`, `usb` and
-`esp_audio_codec` via the IDF component manager (versions pinned in
-`dependencies.lock`).
+Needs **ESP-IDF v5.5+** and an S2/S3/P4 board (those have USB-OTG host).
+First build downloads `usb_host_uac`, `usb` and `esp_audio_codec` automatically.
 
-Expected log:
+## 📊 Health line
+
+Every 15 s the firmware reports its vitals — a healthy stream looks like this:
 
 ```
-I (1570) radio: headphone streaming at 48000 Hz / 2 ch / 16-bit
-I (3336) radio: got IP 192.168.0.144
-I (3748) esp-x509-crt-bundle: Certificate validated
-I (4253) radio: streaming from https://flow.emm.usp.br:8008/radiousp-128.mp3
-I (4465) radio: stream format: 44100 Hz, 2 ch, 16 bits, 128 bps
+radio: stats: ring=261108 min=252000 (96%) net=15974B/s dec=16021B/s
+              mp3=38.3f/s underruns=0 resyncs=0 drops=0
 ```
 
-`tools/monitor.py` is a dependency-free alternative to `idf.py monitor` that
-resets the board and captures N seconds of log:
+`mp3=38.3f/s` is exactly real-time for 44.1 kHz; `ring` at ~96% means the
+jitter buffer is full; `underruns/resyncs/drops` should stay at **0**.
 
-```sh
-python3 tools/monitor.py /dev/cu.usbmodem5AE80117911 25
-```
+## ⚙️ Gotchas worth knowing
 
-## How it works
+| Area | Detail |
+|---|---|
+| 🧠 PSRAM | Run at **40 MHz** (`CONFIG_SPIRAM_SPEED_40M=y`). At 80 MHz this board went marginal: boot memtest failures, cache stalls, watchdog reboots. |
+| ⚡ CPU | **240 MHz + -O2** (`CONFIG_COMPILER_OPTIMIZATION_PERF=y`). At -Os the resampler loop was ~4× slower and starved the pipeline. |
+| 🔌 USB FIFO | `CONFIG_USB_HOST_HW_BUFFER_BIAS_PERIODIC_OUT=y` — isochronous OUT packets need >128 B (ours: 384 B). |
+| 🎛️ Decoder | Both `esp_audio_dec_register_default()` **and** `esp_audio_simple_dec_register_default()` are required. Only the MP3 codec is enabled to fit the binary. |
+| 📦 Buffering | Playback waits for `PCM_PREBUFFER_BYTES` (0.5 s). The UAC driver halts its isochronous stream when its ring starves, which is audible as clicks — never start dry. |
+| 📡 Wi-Fi | `esp_wifi_set_ps(WIFI_PS_NONE)` — modem sleep adds hundreds of ms of jitter. |
+| 🧩 Carry-over | The MP3 parser leaves partial frames unconsumed across reads; the leftovers **must** be re-fed, not dropped (dropping them halves the data rate → slow-motion audio). |
 
-Tasks (all created in `app_main`):
-
-| Task | Core | Job |
-|---|---|---|
-| `usb_events` | 0 | `usb_host_install()`, pumps USB host library events |
-| `uac_events` | 0 | UAC driver events: open/start headphone on connect |
-| `player` | 0 | drains the PCM ring into the UAC driver (silence on underrun) |
-| `net` | 1 | Wi-Fi, HTTPS stream, MP3 decode, resample, fills the PCM ring |
-
-Details worth knowing:
-
-- **Format negotiation**: the app always renders 48 kHz / 16-bit PCM because
-  that is what the headphone advertises. The MP3 stream is 44.1 kHz, so decoded
-  audio goes through a 64-tap Kaiser-windowed-sinc polyphase resampler
-  (measured 0.0 dB ripple to 20 kHz, images below -35 dBc; 256 phase rows
-  with linear interpolation, int16 x Q15 MACs — ~32% of one 240 MHz core).
-  Sources at other rates (or mono) are handled too.
-- **The decoder** is the `esp_audio_codec` *simple decoder*: its parser scans
-  arbitrary chunk boundaries, but **unconsumed partial-frame bytes must be
-  carried over to the next read** — dropping them halves the data rate.
-- **Registration gotcha**: both `esp_audio_dec_register_default()` *and*
-  `esp_audio_simple_dec_register_default()` must be called — the simple
-  decoder wraps the frame decoders registered by the first call.
-- **Jitter handling**: the player only starts once ~0.5 s of decoded audio is
-  buffered (`PCM_PREBUFFER_BYTES`) and re-buffers to that level after an
-  underrun. That matters because the UAC host driver halts its isochronous
-  stream whenever its ring drops below one URB, and only restarts it on the
-  next `uac_host_device_write()` — a starved feeder produces audible clicks.
-- **Wi-Fi**: power save is disabled (`esp_wifi_set_ps(WIFI_PS_NONE)`);
-  modem-sleep adds hundreds of ms of jitter that the player hears as dropouts.
-- **Reconnect**: any read error/close triggers `esp_http_client` re-init with
-  linear backoff. TLS uses the standard certificate bundle.
-- **Health stats**: every 15 s the firmware logs ring fill level, network and
-  decoder throughput, resampler CPU share, underruns, decoder resyncs and
-  dropped chunks — plus a start-up benchmark of the resampler.
-
-## sdkconfig notes
-
-- `CONFIG_COMPILER_OPTIMIZATION_PERF=y` (-O2) and 240 MHz CPU — the audio
-  pipeline (TLS + MP3 decode + resampling) needs the headroom; at the -Os
-  default the resampler loop measured ~4x slower.
-- `CONFIG_SPIRAM_SPEED_40M=y` — the PCM ring moves ~200 kB/s so PSRAM
-  bandwidth is irrelevant, while 80 MHz ran marginal on this board (random
-  memtest failures and cache stalls). 40 MHz has been rock solid.
-- `CONFIG_USB_HOST_HW_BUFFER_BIAS_PERIODIC_OUT=y` — the S3's 1.25 KB OTG FIFO
-  is split RX / non-periodic TX / periodic TX, and isochronous audio OUT
-  streams from the periodic-TX slice. The default *balanced* bias caps it at
-  **128 bytes**, while USB headphones commonly need 256–512-byte isochronous
-  OUT packets (ours needs 384), failing with
-  `E HCD DWC: EP MPS (384) exceeds supported limit (128)`.
-  Trade-off: the RX (microphone) slice shrinks to ~132 bytes.
-- `CONFIG_SPIRAM=y`, octal — PCM ring + resampler scratch live in PSRAM.
-- All codecs except the MP3 decoder are disabled
-  (`CONFIG_AUDIO_DECODER_*_SUPPORT=n`); with everything enabled the app grew
-  past the default 1.5 MB app partition.
-- `partitions.csv` gives the factory app 8 MB of the 16 MB flash.
-
-## Troubleshooting
+<details>
+<summary>🔧 Troubleshooting</summary>
 
 | Symptom | Cause / fix |
 |---|---|
-| Audio plays slow / half speed, constant glitches | Pipeline starved: check the 15 s stats line — `mp3=` should read ~38 f/s for a 44.1 kHz stream, `underruns=0` |
-| Nothing after "UAC host driver installed" | Device has no power (see *VBUS* above) or dead OTG adapter |
-| `EP MPS (...) exceeds supported limit (128)` | The FIFO-bias fix is missing — keep `CONFIG_USB_HOST_HW_BUFFER_BIAS_PERIODIC_OUT=y` |
-| `Decoder MP3 not registered` | `esp_audio_dec_register_default()` must be called before the simple decoder registration |
-| Boot aborts with `External RAM failed memory test!` | PSRAM timing marginal — run `CONFIG_SPIRAM_SPEED_40M=y` (this repo does) |
-| Interrupt watchdog / random reboots | Same as above: marginal PSRAM stalled both cores on this board |
-| `app partition is too small` | Either trim codecs (see sdkconfig notes) or grow the partition |
-| Volume/mute control warnings | Headset doesn't implement those requests — harmless |
-| Clicks/dropouts | Increase `PCM_RING_BYTES` / `PCM_PREBUFFER_BYTES` or check `rsyncs`/`underruns` in the stats |
-| UAC 2.0-only device (e.g. Apple USB-C dongle) | This driver is UAC 1.0 only; needs a UAC2 host driver or quirk fork |
+| Audio slow / half speed | Check stats: `mp3=` should be ~38 f/s; if not, the pipeline is starving |
+| Nothing after "UAC host driver installed" | Headphone has no power — some boards don't output 5 V on the OTG port; power it externally (VBUS/GND) or use a powered hub |
+| `EP MPS (...) exceeds supported limit (128)` | FIFO bias fix missing (see above) |
+| `External RAM failed memory test!` | PSRAM timing marginal — keep 40 MHz |
+| Random reboots / interrupt watchdog | Same as above |
+| Clicks and dropouts | Increase `PCM_RING_BYTES` / `PCM_PREBUFFER_BYTES`, check `underruns` |
+| UAC 2.0-only device (Apple dongle) | This driver is UAC 1.0 only |
 
-## Repo layout
+</details>
+
+## 📁 Layout
 
 ```
-├── CMakeLists.txt           # ESP-IDF project boilerplate
-├── partitions.csv           # 8 MB factory app on 16 MB flash
-├── sdkconfig.defaults       # target-independent config (FIFO fix, PSRAM, codecs)
-├── main/
-│   ├── main.c               # Wi-Fi + HTTP stream + MP3 decode + resample + UAC
-│   ├── idf_component.yml    # component manager deps (usb_host_uac, usb, esp_audio_codec)
-│   ├── secrets_example.h    # copy to secrets.h and fill in Wi-Fi credentials
-│   └── secrets.h            # gitignored
-└── tools/
-    └── monitor.py           # board reset + serial log capture
+main/main.c            Wi-Fi + HTTP stream + MP3 decode + resample + UAC
+main/secrets.h         your Wi-Fi credentials (gitignored)
+docs/rig.jpg           the photo above
+partitions.csv         8 MB factory app on 16 MB flash
+sdkconfig.defaults     PSRAM 40 MHz, 240 MHz, -O2, FIFO bias, codec trim
+tools/monitor.py       dependency-free serial log capture
 ```
 
-## Possible next steps
+## 🌱 Next ideas
 
-- Open the mic interface (RX) and loop it back to the speaker (needs a custom
-  FIFO split for full duplex)
-- Volume / station selection over a small web UI or buttons
-- An actual "phone": SIP or WebRTC call over the same audio pipeline
+Mic loopback (it already sees the headphone's UAC input interface) · volume/station
+buttons · a tiny web UI · an actual SIP/WebRTC "phone" on the same pipeline.
+
+---
+
+*SPDX-License-Identifier: Apache-2.0*
