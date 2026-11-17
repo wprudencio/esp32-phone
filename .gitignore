@@ -1,0 +1,13 @@
+# ESP-IDF build artifacts
+build/
+sdkconfig
+sdkconfig.old
+
+# Component manager downloads (restored from dependencies.lock on build)
+managed_components/
+
+# Setup logs
+*.log
+
+# macOS
+.DS_Store

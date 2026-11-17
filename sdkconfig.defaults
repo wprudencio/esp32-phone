@@ -1,0 +1,8 @@
+CONFIG_FREERTOS_HZ=1000
+CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=2048
+# USB audio isochronous OUT needs a large periodic TX FIFO slice
+# (default "balanced" bias only allows 128-byte isoc OUT packets,
+#  USB headphones need up to ~512)
+CONFIG_USB_HOST_HW_BUFFER_BIAS_PERIODIC_OUT=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
